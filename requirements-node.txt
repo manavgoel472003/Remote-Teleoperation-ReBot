@@ -1,0 +1,5 @@
+# Extra dependency for the leader and follower nodes, on top of a working
+# lerobot-teleoperate environment (LeRobot + lerobot-robot-seeed-b601 +
+# lerobot-teleoperator-rebot-arm-102 + motorbridge, which already bring in
+# opencv-python and numpy). See the README for those base installs.
+websocket-client>=1.7
