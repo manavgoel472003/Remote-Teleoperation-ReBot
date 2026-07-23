@@ -83,10 +83,15 @@ relay = Relay()
 async def ws_handler(request: web.Request) -> web.WebSocketResponse:
     room_name = request.query.get("room", "default")
     role = request.query.get("role", ROLE_VIEWER)
+    room = relay.room(room_name)
+    # Exactly one command source and one physical arm are allowed per room.
+    # Two leaders must never be able to fight over the same follower.
+    existing = room.arms if role == ROLE_ARM else room.operators if role == ROLE_OPERATOR else None
+    if existing is not None and any(not peer.closed for peer in list(existing)):
+        raise web.HTTPConflict(text=f"room {room_name!r} already has an active {role}")
     ws = web.WebSocketResponse(heartbeat=20, max_msg_size=8 * 1024 * 1024)
     await ws.prepare(request)
 
-    room = relay.room(room_name)
     reg = {ROLE_ARM: room.arms, ROLE_OPERATOR: room.operators}.get(role, room.viewers)
     reg.add(ws)
     peer = request.remote

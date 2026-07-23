@@ -19,6 +19,8 @@ Everything here is dependency-light (numpy + cv2 only) so both the arm venv
 from __future__ import annotations
 
 import json
+import time
+import uuid
 from urllib.parse import quote
 
 import cv2
@@ -35,15 +37,25 @@ TYPE_ACTION = "action"       # leader -> follower : lerobot joint-position actio
 TYPE_STATE = "state"         # arm/follower -> operator/viewers : live status
 TYPE_HELLO = "hello"         # node -> relay : announce role (also in query string)
 TYPE_PING = "ping"
+PROTOCOL_VERSION = 2
 
 
-def action_msg(action: dict, t: float) -> str:
+def new_session_id() -> str:
+    """Return a short process-unique id used to reject stale/out-of-order actions."""
+    return uuid.uuid4().hex
+
+
+def action_msg(action: dict, t: float | None = None, *, seq: int = 0,
+               session: str = "legacy") -> str:
     """Leader -> follower: a lerobot action dict, e.g. {'shoulder_pan.pos': 12.3, …}
     (motor positions in degrees). Kept as plain floats so it is JSON-safe."""
     return json.dumps({
         "type": TYPE_ACTION,
+        "v": PROTOCOL_VERSION,
+        "session": str(session),
+        "seq": int(seq),
         "a": {k: float(v) for k, v in action.items()},
-        "t": float(t),
+        "t": float(time.time() if t is None else t),
     })
 
 

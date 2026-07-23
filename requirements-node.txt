@@ -1,5 +1,3 @@
-# Extra dependency for the leader and follower nodes, on top of a working
-# lerobot-teleoperate environment (LeRobot + lerobot-robot-seeed-b601 +
-# lerobot-teleoperator-rebot-arm-102 + motorbridge, which already bring in
-# opencv-python and numpy). See the README for those base installs.
+# Extra dependency for leader_node.py and follower_node.py. Install it inside
+# the guide-compatible `rebot_rs` conda environment.
 websocket-client>=1.7

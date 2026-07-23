@@ -6,26 +6,27 @@ Connects the B601 follower (RS *or* DM) through the lerobot plugin
 and links to the self-hosted relay:
 
   * RECEIVES the leader's joint-position action dict and applies it with the
-    plugin's own `send_action` (which clips to joint limits and can cap per-step
-    motion via --max-relative-target).
+    official plugin's `send_action`, including its RS mapping and joint limits.
   * SENDS its camera as JPEG frames (status HUD overlaid) so browser viewers
     anywhere can watch, plus periodic joint state.
 
 Pairs with leader_node.py. Bidirectional: either machine can be leader or
 follower, so you can drive their arm or they can drive yours.
 
-SAFETY:
+SAFETY AND SMOOTHNESS:
   * every action is clipped to the follower's configured joint_limits (plugin)
-  * `--max-relative-target DEG` caps how far each joint may jump per update, so a
-    big pose gap or a bad packet slews gently instead of lurching (default 8°)
+  * control runs at a fixed rate (60 Hz max), independent of network/camera jitter
+  * only the newest sequenced packet is applied; stale packets are rejected
+  * feedback is polled at a lower rate so it does not flood the seven-motor CAN bus
   * watchdog: if no action arrives within --watchdog s (link drop/pause), we stop
-    sending — POS_VEL holds the last commanded pose
+    sending and the RS MIT controller holds its last commanded pose
   * Ctrl+C disconnects (plugin disables torque on disconnect by default)
 
-Run in the conda `lerobot` env (py3.12 — has lerobot + the plugin + motorbridge):
-    conda activate lerobot
-    pip install websocket-client
-    sudo ip link set can0 up type can bitrate 1000000            # RS on SocketCAN
+Run in the verified `rebot_rs` env from the Seeed B601-RS guide:
+    conda activate rebot_rs
+    sudo ip link set can0 down 2>/dev/null
+    sudo ip link set can0 type can bitrate 1000000 restart-ms 100
+    sudo ip link set can0 up
     python follower_node.py --relay YOUR_VM:8765 --room b601 \
         --arm rs --port can0 --can-adapter socketcan --id follower1 --camera 0
     # Damiao serial bridge instead:
@@ -37,7 +38,10 @@ No-hardware link/video test:
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
+import math
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -54,6 +58,50 @@ from camera import Camera                       # noqa: E402
 
 JOINTS = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex",
           "wrist_yaw", "wrist_roll", "gripper"]
+ACTION_KEYS = {f"{joint}.pos" for joint in JOINTS}
+
+
+def _version_tuple(value: str) -> tuple[int, ...]:
+    parts = []
+    for piece in value.split("."):
+        digits = "".join(ch for ch in piece if ch.isdigit())
+        if not digits:
+            break
+        parts.append(int(digits))
+    return tuple(parts)
+
+
+def preflight(arm: str, port: str, can_adapter: str) -> None:
+    required = {
+        "lerobot": "0.4.4",
+        "lerobot-robot-seeed-b601": "1.0.0",
+        "motorbridge": "0.5.0",
+        "websocket-client": "1.0.0",
+    }
+    for package, minimum in required.items():
+        try:
+            actual = importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError as exc:
+            raise RuntimeError(f"missing package {package!r}; activate conda env rebot_rs") from exc
+        if _version_tuple(actual) < _version_tuple(minimum):
+            raise RuntimeError(f"{package} {actual} is too old; need >= {minimum}")
+    if arm == "rs" and can_adapter != "socketcan":
+        raise RuntimeError("B601-RS requires --can-adapter socketcan")
+    if arm == "rs":
+        check = subprocess.run(
+            ["ip", "-details", "link", "show", port], text=True,
+            capture_output=True, check=False,
+        )
+        if check.returncode:
+            raise RuntimeError(f"SocketCAN interface {port!r} does not exist")
+        details = check.stdout
+        if "UP" not in details.splitlines()[0] or "bitrate 1000000" not in details:
+            raise RuntimeError(
+                f"{port} must be UP at 1,000,000 bit/s; follow the Seeed CAN setup commands"
+            )
+        if "restart-ms 100" not in details:
+            print(f"[follower] WARNING: {port} is not configured with restart-ms 100")
+    print("[follower] preflight OK: official B601 plugin and MotorBridge stack")
 
 
 def build_follower(arm: str, port: str, can_adapter: str, robot_id: str,
@@ -77,19 +125,31 @@ class FollowerState:
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.action: dict | None = None
+        self.action_number = 0
         self.last_rx = 0.0
+        self.session: str | None = None
+        self.last_seq = -1
         self.measured: dict[str, float] = {}
         self.following = False
         self.connected = False
 
-    def set_action(self, a: dict) -> None:
+    def set_action(self, a: dict, session: str, seq: int) -> bool:
         with self.lock:
+            if session != self.session:
+                self.session = session
+                self.last_seq = -1
+            if seq <= self.last_seq:
+                return False
+            self.last_seq = seq
             self.action = a
+            self.action_number += 1
             self.last_rx = time.monotonic()
+            return True
 
     def snapshot_action(self):
         with self.lock:
-            return (dict(self.action) if self.action else None, self.last_rx)
+            return (dict(self.action) if self.action else None, self.last_rx,
+                    self.action_number)
 
     def publish(self, measured: dict, following: bool, connected: bool) -> None:
         with self.lock:
@@ -102,28 +162,46 @@ class FollowerState:
             return dict(self.measured), self.following, self.connected
 
 
-def _control_loop(robot, state: FollowerState, watchdog: float,
-                  fake: bool, stop: threading.Event) -> None:
+def _control_loop(robot, state: FollowerState, watchdog: float, control_hz: float,
+                  feedback_hz: float, fake: bool, stop: threading.Event) -> None:
+    period = 1.0 / control_hz
+    feedback_period = 1.0 / feedback_hz
+    last_applied = -1
+    last_feedback = 0.0
+    measured: dict[str, float] = {}
+    control_count = 0
+    count_t0 = time.monotonic()
     while not stop.is_set():
-        action, last_rx = state.snapshot_action()
-        fresh = action is not None and (time.monotonic() - last_rx) < watchdog
-        measured: dict[str, float] = {}
+        tick = time.monotonic()
+        action, last_rx, action_number = state.snapshot_action()
+        fresh = action is not None and (tick - last_rx) < watchdog
         if fake:
             if fresh:
                 measured = {k.removesuffix(".pos"): v for k, v in action.items()}
             state.publish(measured, fresh, False)
-            time.sleep(0.02)
+            stop.wait(max(0.0, period - (time.monotonic() - tick)))
             continue
         try:
-            if fresh:
-                robot.send_action(action)          # plugin clips + caps + sends
-            obs = robot.get_observation()
-            measured = {m: float(obs.get(f"{m}.pos", 0.0)) for m in JOINTS}
+            # Apply each newest network sample once. Dropping superseded samples is
+            # intentional: it prevents a delayed queue from replaying stale motion.
+            if fresh and action_number != last_applied:
+                robot.send_action(action)
+                last_applied = action_number
+                control_count += 1
+            if tick - last_feedback >= feedback_period:
+                obs = robot.get_observation()
+                measured = {m: float(obs.get(f"{m}.pos", 0.0)) for m in JOINTS}
+                last_feedback = tick
             state.publish(measured, fresh, True)
         except Exception as e:   # noqa: BLE001 - keep streaming even if a poll hiccups
             print(f"[follower] control error: {e}")
             state.publish(measured, fresh, True)
-        time.sleep(0.005)
+        now = time.monotonic()
+        if now - count_t0 >= 5.0:
+            print(f"[follower] applied action rate={control_count / (now - count_t0):.1f} Hz")
+            control_count = 0
+            count_t0 = now
+        stop.wait(max(0.0, period - (time.monotonic() - tick)))
 
 
 def _camera_loop(cam: Camera, link: RelayLink, state: FollowerState, arm: str,
@@ -167,16 +245,27 @@ def main() -> None:
     ap.add_argument("--can-adapter", default="socketcan", choices=("socketcan", "damiao", "robstride"))
     ap.add_argument("--id", default="follower1", help="lerobot robot id (calibration file)")
     ap.add_argument("--no-calibrate", action="store_true", help="skip the connect-time calibration prompt")
-    ap.add_argument("--max-relative-target", type=float, default=8.0,
-                    help="cap per-update joint motion in degrees (None-like 0 disables)")
+    ap.add_argument("--max-relative-target", type=float, default=0.0,
+                    help="optional plugin safety cap; 0 matches Seeed's verified default")
     ap.add_argument("--camera", default="0", help="cv2 camera index, or 'test'")
     ap.add_argument("--width", type=int, default=640)
     ap.add_argument("--height", type=int, default=480)
     ap.add_argument("--fps", type=float, default=20.0)
     ap.add_argument("--jpeg-quality", type=int, default=P.JPEG_QUALITY)
     ap.add_argument("--watchdog", type=float, default=0.4)
+    ap.add_argument("--control-hz", type=float, default=60.0,
+                    help="maximum action application rate (official LeRobot default: 60)")
+    ap.add_argument("--feedback-hz", type=float, default=10.0,
+                    help="CAN feedback/HUD polling rate")
+    ap.add_argument("--relay-timeout", type=float, default=10.0)
     ap.add_argument("--fake", action="store_true", help="don't connect hardware (link/video test)")
     args = ap.parse_args()
+    if not 1.0 <= args.control_hz <= 60.0:
+        ap.error("--control-hz must be between 1 and 60")
+    if not 1.0 <= args.feedback_hz <= args.control_hz:
+        ap.error("--feedback-hz must be between 1 and --control-hz")
+    if args.watchdog <= 0:
+        ap.error("--watchdog must be positive")
 
     state = FollowerState()
 
@@ -186,8 +275,17 @@ def main() -> None:
             return
         a = m.get("a") or {}
         # normalise to '<motor>.pos' keys the plugin expects
-        state.set_action({(k if k.endswith(".pos") else f"{k}.pos"): float(v)
-                          for k, v in a.items()})
+        try:
+            action = {(k if k.endswith(".pos") else f"{k}.pos"): float(v)
+                      for k, v in a.items()}
+            seq = int(m.get("seq", 0))
+            session = str(m.get("session", "legacy"))
+        except (TypeError, ValueError):
+            return
+        if set(action) != ACTION_KEYS or not all(math.isfinite(v) for v in action.values()):
+            print("[follower] rejected malformed action")
+            return
+        state.set_action(action, session, seq)
 
     url = P.build_ws_url(args.relay, args.room, "arm")   # follower is the 'arm' role on the relay
     link = RelayLink(url, on_text=_on_text, name="follower")
@@ -196,15 +294,27 @@ def main() -> None:
 
     robot = None
     if not args.fake:
+        preflight(args.arm, args.port, args.can_adapter)
         max_rel = args.max_relative_target if args.max_relative_target and args.max_relative_target > 0 else None
         robot = build_follower(args.arm, args.port, args.can_adapter, args.id, max_rel)
+        if args.no_calibrate and not robot.is_calibrated:
+            raise RuntimeError(
+                f"no calibration for robot id {args.id!r}; run lerobot-calibrate first"
+            )
         print(f"[follower] connecting {args.arm} on {args.port} ({args.can_adapter}) …")
         robot.connect(calibrate=not args.no_calibrate)
         print("[follower] connected. Waiting for the leader…")
 
     link.start()
+    if not link.wait_connected(args.relay_timeout):
+        if robot is not None:
+            robot.disconnect()
+        cam.release()
+        link.stop()
+        raise RuntimeError(f"relay did not connect within {args.relay_timeout:.1f}s: {url}")
     threading.Thread(target=_control_loop, name="ctrl",
-                     args=(robot, state, args.watchdog, args.fake, stop), daemon=True).start()
+                     args=(robot, state, args.watchdog, args.control_hz,
+                           args.feedback_hz, args.fake, stop), daemon=True).start()
     threading.Thread(target=_camera_loop, name="cam",
                      args=(cam, link, state, args.arm, args.jpeg_quality, args.fps, stop),
                      daemon=True).start()

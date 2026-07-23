@@ -61,20 +61,25 @@ class RelayLink:
         t.start()
         return t
 
-    def send_frame(self, jpeg: bytes) -> None:
-        self._send(jpeg, ABNF.OPCODE_BINARY)
+    def wait_connected(self, timeout: float) -> bool:
+        return self.connected.wait(timeout=max(0.0, timeout))
 
-    def send_text(self, text: str) -> None:
-        self._send(text, ABNF.OPCODE_TEXT)
+    def send_frame(self, jpeg: bytes) -> bool:
+        return self._send(jpeg, ABNF.OPCODE_BINARY)
 
-    def _send(self, data, opcode) -> None:
+    def send_text(self, text: str) -> bool:
+        return self._send(text, ABNF.OPCODE_TEXT)
+
+    def _send(self, data, opcode) -> bool:
         if not self.connected.is_set() or self.ws is None:
-            return
+            return False
         try:
             with self._send_lock:
                 self.ws.send(data, opcode=opcode)
+            return True
         except Exception:   # noqa: BLE001 - reader thread reconnects
             self.connected.clear()
+            return False
 
     def stop(self):
         self._stop = True
